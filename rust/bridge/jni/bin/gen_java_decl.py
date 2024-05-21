@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+
+#
+# Copyright (C) 2020-2021 Signal Messenger, LLC.
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+
+import difflib
+import os
+import subprocess
+import re
+import sys
+
+
+# If the command-line handling below gets any more complicated, this should be switched to argparse.
+def print_usage_and_exit():
+    print('usage: %s [--verify]' % sys.argv[0], file=sys.stderr)
+    sys.exit(2)
+
+
+mode = None
+if len(sys.argv) > 2:
+    print_usage_and_exit()
+elif len(sys.argv) == 2:
+    mode = sys.argv[1]
+    if mode != '--verify':
+        print_usage_and_exit()
+
+our_abs_dir = os.path.dirname(os.path.realpath(__file__))
+
+cbindgen = subprocess.Popen(['cbindgen'], cwd=os.path.join(our_abs_dir, '..'), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+(stdout, stderr) = cbindgen.communicate()
+
+stdout = str(stdout.decode('utf8'))
+stderr = str(stderr.decode('utf8'))
+
+ignore_this_warning = re.compile(
+    "("
+    r"WARN: Can't find .*\. This usually means that this type was incompatible or not found\.|"
+    r"WARN: Missing `\[defines\]` entry for `feature = \".*\"` in cbindgen config\.|"
+    r"WARN: Missing `\[defines\]` entry for `target_os = \"android\"` in cbindgen config\.|"
+    r"WARN: Missing `\[defines\]` entry for `ios_device_as_detected_in_build_rs` in cbindgen config\.|"
+    r"WARN: Skip libsignal-bridge::.+ - \(not `(?:pub|no_mangle)`\)\.|"
+    r"WARN: Couldn't find path for Array\(Path\(GenericPath \{ .+ \}\), Name\(\"LEN\"\)\), skipping associated constants|"
+    r"WARN: Cannot find a mangling for generic path GenericPath { path: Path { name: \"JavaCompletableFuture\" }.+|"
+    r"WARN: Cannot find a mangling for generic path GenericPath { path: Path { name: \"Throwing\" }.+"
+    ")")
+
+unknown_warning = False
+
+for l in stderr.split('\n'):
+    if l == "":
+        continue
+
+    if ignore_this_warning.match(l):
+        continue
+
+    print(l, file=sys.stderr)
+    unknown_warning = True
+
+if unknown_warning:
+    sys.exit(1)
+
+java_decl = re.compile(r"""
+    ([a-zA-Z0-9]+(?:<.+>)?)[ ]                 # (0) A possibly-generic return type
+    Java_org_signal_libsignal_internal_Native_ # The required JNI prefix
+    (([a-zA-Z0-9]+)                            # (1) The method name, with (2) a grouping prefix
+     (?:_1[a-zA-Z0-9_]*)?)                     # ...possibly followed by an underscore and then more name
+    \(JNIEnv[ ].?env,[ ]JClass[ ]class_        # and then the required JNI args,
+     (,[ ].*)?\);                              # then (3) actual args
+    """, re.VERBOSE)
+
+
+def box_primitive_if_needed(typ):
+    type_map = {
+        "void": "Void",
+        "boolean": "Boolean",
+        "char": "Character",
+        "byte": "Byte",
+        "short": "Short",
+        "int": "Integer",
+        "long": "Long",
+        "float": "Float",
+        "double": "Double",
+    }
+
+    return type_map.get(typ, typ)
+
+
+def translate_to_java(typ):
+    type_map = {
+        "void": "void",
+        "JString": "String",
+        "JObject": "Object",
+        "JClass": "Class",
+        "JByteArray": "byte[]",
+        "JLongArray": "long[]",
+        "JObjectArray": "Object[]",
+        "ObjectHandle": "long",
+        "jint": "int",
+        "jlong": "long",
+        "jboolean": "boolean",
+        "JavaArrayOfByteArray": "byte[][]",
+        "JavaByteBufferArray": "ByteBuffer[]",
+    }
+
+    if typ in type_map:
+        return (type_map[typ], False)
+
+    if typ == 'Throwing':
+        return ('void', True)
+
+    if (stripped := typ.removeprefix('Throwing<')) != typ:
+        assert stripped.endswith('>')
+        return (translate_to_java(stripped.removesuffix('>'))[0], True)
+
+    if (stripped := typ.removeprefix('JavaCompletableFuture<')) != typ:
+        assert stripped.endswith('>')
+        inner = translate_to_java(stripped.removesuffix('>'))[0]
+        return (f'CompletableFuture<{box_primitive_if_needed(inner)}>', False)
+
+    # Assume anything else prefixed with "Java" refers to an object
+    if typ.startswith('Java'):
+        return (typ[4:], False)
+
+    raise Exception("Don't know what to do with a", typ)
+
+
+cur_type = None
+decls = []
+
+for line in stdout.split('\n'):
+    if line == '':
+        continue
+
+    match = java_decl.match(line)
+    if match is None:
+        raise Exception("Could not understand", line)
+
+    (ret_type, method_name, this_type, args) = match.groups()
+
+    # Add newlines between groups of functions for readability
+    if cur_type is None or this_type != cur_type:
+        decls.append("")
+        cur_type = this_type
+
+    java_fn_name = method_name.replace('_1', '_')
+    (java_ret_type, is_throwing) = translate_to_java(ret_type)
+    java_args = []
+
+    if args is not None:
+        for arg in args.split(', ')[1:]:
+            (arg_type, arg_name) = arg.split(' ')
+            (java_arg_type, _is_throwing) = translate_to_java(arg_type)
+            java_args.append('%s %s' % (java_arg_type, arg_name))
+
+    decls.append("  public static native %s %s(%s)%s;" % (
+        java_ret_type,
+        java_fn_name,
+        ", ".join(java_args),
+        " throws Exception" if is_throwing else ""))
+
+template_file = open(os.path.join(our_abs_dir, 'Native.java.in')).read()
+
+contents = template_file.replace('\n  // INSERT DECLS HERE', "\n".join(decls))
+
+native_java = os.path.join(our_abs_dir, '../../../../java/shared/java/org/signal/libsignal/internal/Native.java')
+
+if not os.access(native_java, os.F_OK):
+    raise Exception("Didn't find Native.java where it was expected")
+
+if not mode:
+    with open(native_java, 'w') as fh:
+        fh.write(contents)
+elif mode == '--verify':
+    with open(native_java) as fh:
+        current_contents = fh.readlines()
+    diff = difflib.unified_diff(current_contents, contents.splitlines(keepends=True))
+    first_line = next(diff, None)
+    if first_line:
+        sys.stdout.write(first_line)
+        sys.stdout.writelines(diff)
+        sys.exit("error: Native.java not up to date; re-run %s!" % sys.argv[0])
+else:
+    raise Exception("mode not properly validated")

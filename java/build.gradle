@@ -1,0 +1,94 @@
+plugins {
+    id "base"
+    id "signing"
+    id "com.diffplug.spotless" version "6.20.0"
+    id "io.github.gradle-nexus.publish-plugin" version "1.3.0"
+}
+
+allprojects {
+    version = "0.46.2"
+    group   = "org.signal"
+}
+
+subprojects {
+    if (JavaVersion.current().isJava8Compatible()) {
+        allprojects {
+            tasks.withType(Javadoc) {
+                options.encoding = 'UTF-8'
+                options.addStringOption('Xdoclint:none', '-quiet')
+            }
+        }
+    }
+
+    allprojects {
+        tasks.withType(JavaCompile) {
+            options.encoding = 'UTF-8'
+            options.compilerArgs += ["-Xlint:deprecation", "-Xlint:fallthrough", "-Xlint:unchecked"]
+        }
+    }
+
+    apply plugin: "com.diffplug.spotless"
+    spotless {
+        java {
+            target('**/*.java')
+            targetExclude('**/Native.java')
+            importOrder()
+            removeUnusedImports()
+
+            googleJavaFormat()
+            formatAnnotations()
+            licenseHeaderFile rootProject.file('license_header.txt')
+        }
+    }
+}
+
+task makeJniLibrariesDesktop(type:Exec) {
+  group 'Rust'
+  description 'Build the JNI libraries'
+
+  // Explicitly specify 'bash' for Windows compatibility.
+  commandLine 'bash', './build_jni.sh', 'desktop'
+}
+
+task cargoClean(type:Exec) {
+  group 'Rust'
+  commandLine 'cargo', 'clean'
+}
+
+task cleanJni(type: Delete) {
+  description 'Clean JNI libs'
+  delete fileTree('./android/src/main/jniLibs') {
+    include '**/*.so'
+  }
+  delete fileTree('./shared/resources') {
+    include '**/*.so'
+    include '**/*.dylib'
+    include '**/*.dll'
+  }
+}
+
+clean.dependsOn([cargoClean, cleanJni])
+
+// PUBLISHING
+
+ext.setUpSigningKey = { signingExt -> 
+    def signingKeyId = findProperty("signingKeyId")
+    def signingKey = findProperty("signingKey")
+    def signingPassword = findProperty("signingPassword")
+    if (signingKeyId && signingKey && signingPassword) {
+        signingExt.useInMemoryPgpKeys(signingKeyId.trim(), signingKey.trim(), signingPassword.trim())
+    }
+}
+
+nexusPublishing {
+    repositories {
+        sonatype {
+            username = project.findProperty('sonatypeUsername') ?: ""
+            password = project.findProperty('sonatypePassword') ?: ""
+        }
+    }
+}
+
+def isReleaseBuild() {
+    return version.contains("SNAPSHOT") == false
+}

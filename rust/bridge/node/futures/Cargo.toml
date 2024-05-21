@@ -1,0 +1,31 @@
+#
+# Copyright 2020-2021 Signal Messenger, LLC.
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+
+[package]
+name = "signal-neon-futures"
+version = "0.1.0"
+authors = ["Signal Messenger LLC"]
+license = "AGPL-3.0-only"
+edition = "2021"
+
+[[test]]
+name = "signal-neon-futures-tests"
+path = "tests/node.rs"
+harness = false
+
+[[bench]]
+name = "signal-neon-futures-bench"
+path = "benches/node.rs"
+harness = false
+
+[dependencies]
+futures-util = "0.3.7"
+neon = { version = "1.0.0", default-features = false, features = ["napi-4"] }
+
+[dev-dependencies]
+signal-neon-futures-tests = { path = "tests-node-module" }
+
+[features]
+napi-6 = ["neon/napi-6"]
